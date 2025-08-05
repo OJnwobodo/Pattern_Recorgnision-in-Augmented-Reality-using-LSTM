@@ -1,0 +1,162 @@
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+using TMPro;
+using System.IO;
+using UnityEngine.SceneManagement;
+using MixedReality.Toolkit.UX;
+
+public class UserManager : MonoBehaviour
+{
+    public TMP_InputField inputUserName;
+    public TMP_InputField inputUserID;
+
+    public PressableButton saveButton;
+    public PressableButton experimentButton;
+
+    public TextMeshProUGUI messageText;
+
+    private string userFilePath;
+    private Dictionary<string, string> userDatabase;
+    public static string currentUserID;
+    public static string currentUserName;
+
+    private TouchScreenKeyboard keyboard;
+    private TMP_InputField focusedInputField;
+    private bool isKeyboardOpen = false;
+    private bool isInputSaved = false;
+
+    void Start()
+    {
+        userFilePath = Path.Combine(Application.persistentDataPath, "users.json");
+        userDatabase = new Dictionary<string, string>();
+
+        LoadUserData();
+
+        saveButton.OnClicked.AddListener(SaveUserData);
+        experimentButton.OnClicked.AddListener(LoadExperiment);
+
+        messageText.text = "";
+
+        // Add listeners to TMP_InputFields
+        //inputUserName.onSelect.AddListener((_) => OpenSystemKeyboard(inputUserName));
+        //inputUserID.onSelect.AddListener((_) => OpenSystemKeyboard(inputUserID));
+    }
+    public void OpenKeyboard(TMP_InputField inputField)
+    {
+        if (!isKeyboardOpen)
+        {
+            keyboard = TouchScreenKeyboard.Open(inputField.text, TouchScreenKeyboardType.Default);
+            focusedInputField = inputField;
+            isKeyboardOpen = true;
+        }
+    }
+
+    public void CloseKeyboard()
+    {
+        if (isKeyboardOpen)
+        {
+            isKeyboardOpen = false;
+            keyboard = null;
+            focusedInputField = null;
+        }
+    }
+    void Update()
+    {
+        // Check if any input field is focused
+        bool isAnyFieldFocused = inputUserName.isFocused || inputUserID.isFocused;
+
+        // Open the keyboard if an input field is focused and it's not already open
+        if (isAnyFieldFocused && !isKeyboardOpen)
+        {
+            if (inputUserName.isFocused)
+                OpenKeyboard(inputUserName);
+            else if (inputUserID.isFocused)
+                OpenKeyboard(inputUserID);
+        }
+
+        // Close the keyboard if it's open, and no input field is focused
+        else if (!isAnyFieldFocused && isKeyboardOpen)
+        {
+            CloseKeyboard();
+        }
+
+        // Update the input field when the keyboard text changes
+        if (keyboard != null && keyboard.status == TouchScreenKeyboard.Status.Visible && focusedInputField != null)
+        {
+            focusedInputField.text = keyboard.text;
+        }
+    }
+
+
+
+    public void SaveUserData()
+    {
+        messageText.text = "";
+
+        currentUserName = inputUserName.text;
+        currentUserID = inputUserID.text;
+
+        if (string.IsNullOrEmpty(currentUserName) || string.IsNullOrEmpty(currentUserID))
+        {
+            messageText.text = "Please enter both Username and User ID.";
+            Debug.LogError("Username or UserID is empty.");
+            return;
+        }
+
+        userDatabase[currentUserID] = currentUserName;
+        SaveUserDataToFile();
+
+        messageText.text = $"User {currentUserName} has been saved. You may now proceed with the experiment.";
+        Debug.Log($"User {currentUserName} with ID {currentUserID} has been saved.");
+    }
+
+    public void LoadExperiment()
+    {
+        SaveUserDataToFile();
+        SceneManager.LoadScene("ExperimentScene");
+        Debug.Log("Experiment button clicked.");
+    }
+
+    private void LoadUserData()
+    {
+        if (File.Exists(userFilePath))
+        {
+            string json = File.ReadAllText(userFilePath);
+            userDatabase = JsonUtility.FromJson<SerializableDictionary>(json).ToDictionary();
+        }
+    }
+
+    private void SaveUserDataToFile()
+    {
+        SerializableDictionary serializableDictionary = new SerializableDictionary(userDatabase);
+        string json = JsonUtility.ToJson(serializableDictionary);
+        File.WriteAllText(userFilePath, json);
+    }
+}
+
+[Serializable]
+public class SerializableDictionary
+{
+    public List<string> Keys = new List<string>();
+    public List<string> Values = new List<string>();
+
+    public SerializableDictionary(Dictionary<string, string> dict)
+    {
+        foreach (var kvp in dict)
+        {
+            Keys.Add(kvp.Key);
+            Values.Add(kvp.Value);
+        }
+    }
+
+    public Dictionary<string, string> ToDictionary()
+    {
+        Dictionary<string, string> dict = new Dictionary<string, string>();
+        for (int i = 0; i < Keys.Count; i++)
+        {
+            dict[Keys[i]] = Values[i];
+        }
+        return dict;
+    }
+}
