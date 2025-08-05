@@ -1,1 +1,1 @@
-# Pattern_Recorgnision-in-Augmented-Reality-using-LSTM
+# Pattern_Recognition-in-Augmented-Reality-using-LSTM
