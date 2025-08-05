@@ -1,0 +1,522 @@
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using TMPro;
+using UnityEngine.XR;
+
+/* ───────────────────────────── BurstRecorder ────────────────────────── */
+
+/* ──────────────────────────  MAIN MANAGER  ─────────────────────────── */
+public class GazeInteractionManager : MonoBehaviour
+{
+    /* -------- inspector refs -------- */
+    [Header("Scene Objects")]
+    public GameObject sphereParent;
+    public GameObject headTrackingParent;
+    public GameObject handGestureHolder;
+
+    [Header("UI")]
+    public TextMeshProUGUI welcomeText, sphereText,
+                            capsuleText, handGestureText, timerText;
+
+    [Header("Parameters")]
+    public float gazeDelay = 0.5f;
+    public float moveDistance = 8f;
+    public float totalSessionTime = 600f;
+    float burstHz = 5f;  
+    float burstSpan = 1.5f; 
+    public float planeSnapDistance = 2.35f;  
+    float headPickStartTime = -1f;
+
+
+    /* -------- private state ---------- */
+    Camera cam;
+    float sessionTimer;
+    bool timerRunning;
+
+    /* eye-tracking */
+    GameObject[] spheres;
+    readonly Dictionary<GameObject, bool> sphereGazed =
+         new Dictionary<GameObject, bool>();
+    readonly Dictionary<GameObject, float> gazeStartTimes = new Dictionary<GameObject, float>();
+
+
+    /* head-tracking */
+    GameObject cylinder;      // the one we move with the head
+    GameObject[] cylinders;   // all HeadTask objects (for prep)
+    GameObject[] planes;      // HeadTarget0,1,2…
+    int targetIdx;
+    bool cylFollowing;
+    Vector3 offsetPos;
+    Quaternion offsetRot;
+
+    /* misc */
+    bool isEye, isHead, isHand, instructionShown;
+
+    /* logging */
+    string csvPath, sessionId;
+    float firstRel = -1f, lastRel = -1f;
+    Vector3 lastHead, lastHand;
+    int stepIdx;
+
+   
+    void Start()
+    {
+        cam = Camera.main;
+        sessionTimer = totalSessionTime;
+
+        CacheSceneObjects();
+        InitLogging();
+        InitUI();
+
+        sphereParent.SetActive(false);
+        headTrackingParent.SetActive(false);
+        if (handGestureHolder) handGestureHolder.SetActive(false);
+
+        //string burstFile = Path.Combine(Application.persistentDataPath, "HeadBursts.csv");
+        // burst = new BurstRecorder(
+        //   burstFile, burstHz, burstSpan,
+        //cam,
+        //  handGestureHolder ? handGestureHolder.transform : null
+        // );
+    }
+
+    void Update()
+    {
+        UpdateTimer();
+
+        if (isEye)
+            UpdateEyeTracking();
+
+        if (isHead)
+            UpdateHeadTracking();
+
+        // note: cylinder follow happens in LateUpdate only
+    }
+
+    void LateUpdate()
+    {
+        if (!isHead || !cylFollowing) return;
+
+        // follow head
+        cylinder.transform.position = cam.transform.TransformPoint(offsetPos);
+        cylinder.transform.rotation = cam.transform.rotation * offsetRot;
+
+        // auto‐snap if within distance
+        float sqr = (cylinder.transform.position -
+                     planes[targetIdx].transform.position).sqrMagnitude;
+
+        if (sqr <= planeSnapDistance * planeSnapDistance)
+            PlaceOnPlane();
+    }
+
+    /* ────────────────────── SETUP (spheres, cylinder, planes) ────────────────── */
+    void CacheSceneObjects()
+    {
+        // — spheres —
+        var sList = new List<GameObject>();
+        foreach (Transform t in sphereParent.transform)
+            sList.Add(t.gameObject);
+        spheres = sList.ToArray();
+
+        foreach (var s in spheres)
+        {
+            if (!s.TryGetComponent<Collider>(out _))
+                s.AddComponent<SphereCollider>();
+            sphereGazed[s] = false;
+        }
+
+        // — cylinders & planes —
+        var cylList = new List<GameObject>();
+        var planeList = new List<GameObject>();
+        foreach (Transform t in headTrackingParent.transform)
+        {
+            if (t.name.StartsWith("HeadTask"))
+                cylList.Add(t.gameObject);
+            else if (t.name.StartsWith("HeadTarget"))
+                planeList.Add(t.gameObject);
+        }
+
+        // sort targets by name
+        planeList.Sort((a, b) => string.CompareOrdinal(a.name, b.name));
+
+        cylinders = cylList.ToArray();
+        planes = planeList.ToArray();
+        targetIdx = 0;
+
+        if (cylinders.Length == 0)
+        {
+            Debug.LogError("⚠ No HeadTask objects found!");
+            return;
+        }
+
+        // we only move the first cylinder
+        cylinder = cylinders[0];
+
+        // prepare colliders & rigidbodies
+        foreach (var c in cylinders)
+        {
+            if (!c.TryGetComponent<Collider>(out _))
+                c.AddComponent<CapsuleCollider>();
+            if (!c.TryGetComponent<Rigidbody>(out Rigidbody rb))
+                rb = c.AddComponent<Rigidbody>();
+
+            rb.isKinematic = true;
+            rb.useGravity = false;
+            rb.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
+            c.layer = LayerMask.NameToLayer("Default");
+        }
+
+        // set initial plane colours
+        for (int i = 0; i < planes.Length; i++)
+        {
+            var p = planes[i];
+            var col = (i == 0) ? Color.green : Color.gray;
+            (p.GetComponent<Collider>() ?? p.AddComponent<BoxCollider>()).isTrigger = true;
+            p.GetComponent<Renderer>().material.color = col;
+        }
+    }
+
+    /* ───────────────────────────── LOGGING ─────────────────────────── */
+    void InitLogging()
+    {
+        csvPath = Path.Combine(Application.persistentDataPath, "InteractionEvents.csv");
+        sessionId = Random.Range(1000, 9999).ToString();
+
+        if (!File.Exists(csvPath))
+            File.WriteAllText(csvPath,
+            "SessionID,UserID,UserName,StepIndex,InteractionType,ObjectName,"
+             + "RelativeTime,StartTime,EndTime,Duration,InteractionInterval,"
+             + "ObjectPosX,ObjectPosY,ObjectPosZ,"
+             + "HeadPosX,HeadPosY,HeadPosZ,HeadRotX,HeadRotY,HeadRotZ,HeadRotW,"
+             + "LeftHandPosX,LeftHandPosY,LeftHandPosZ,LeftHandRotX,LeftHandRotY,LeftHandRotZ,LeftHandRotW,"
+             + "RightHandPosX,RightHandPosY,RightHandPosZ,RightHandRotX,RightHandRotY,RightHandRotZ,RightHandRotW,"
+             + "GazeDirX,GazeDirY,GazeDirZ,DistanceToObject,HeadVelocity,LeftHandVelocity,RightHandVelocity,SpeedTier\n");
+
+
+        lastHead = cam.transform.position;
+        lastHand = handGestureHolder
+                   ? handGestureHolder.transform.position
+                   : Vector3.zero;
+    }
+
+    /* ────────────────────────── UI helpers ─────────────────────────── */
+    void InitUI()
+    {
+        welcomeText.text = "Choose an exercise to begin";
+        sphereText.text =
+        capsuleText.text =
+        handGestureText.text = "";
+        timerText.text = "";
+    }
+
+    /* ────────────────────────── MODE TOGGLES ───────────────────────── */
+    public void StartEyeTracking()
+    {
+        isEye = true; isHead = isHand = false;
+        instructionShown = true;
+
+        sphereParent.SetActive(true);
+        headTrackingParent.SetActive(false);
+        if (handGestureHolder) handGestureHolder.SetActive(false);
+
+        sphereText.text = "Look at each sphere";
+        StartTimer();
+    }
+
+    public void StartHeadTracking()
+    {
+        isHead = true; isEye = isHand = false;
+        instructionShown = true;
+
+        sphereParent.SetActive(false);
+        headTrackingParent.SetActive(true);
+        if (handGestureHolder) handGestureHolder.SetActive(false);
+
+        // initial colours
+        // first target is green, cylinder starts GREY
+        planes[0].GetComponent<Renderer>().material.color = Color.green;
+        cylinder.GetComponent<Renderer>().material.color = Color.gray;
+        capsuleText.text = "Look at the cylinder to pick it up";
+        StartTimer();
+    }
+
+    public void StartHandGesture()
+    {
+        isHand = true; isEye = isHead = false;
+        instructionShown = true;
+
+        sphereParent.SetActive(false);
+        headTrackingParent.SetActive(false);
+        if (handGestureHolder) handGestureHolder.SetActive(true);
+
+        handGestureText.text = "Pinch / press the coloured objects";
+        StartTimer();
+    }
+
+    void HideInstructions()
+    {
+        if (!instructionShown) return;
+        welcomeText.text =
+        sphereText.text =
+        capsuleText.text =
+        handGestureText.text = "";
+        instructionShown = false;
+    }
+
+    /* ───────────────────────────── TIMER ───────────────────────────── */
+    void StartTimer() => timerRunning = true;
+
+    void UpdateTimer()
+    {
+        if (!timerRunning) return;
+
+        sessionTimer = Mathf.Max(0f, sessionTimer - Time.deltaTime);
+        timerText.text =
+            $"Time Remaining: {Mathf.FloorToInt(sessionTimer / 60):00}:"
+          + $"{Mathf.FloorToInt(sessionTimer % 60):00}";
+
+        if (sessionTimer <= 0f)
+            SceneManager.LoadScene("UserRegistrationScene");
+    }
+
+    /* ────────────────────────── EYE (spheres) ──────────────────────── */
+    void UpdateEyeTracking()
+    {
+        foreach (var s in spheres)
+        {
+            bool gazing = IsGazing(s);
+
+            if (gazing && !sphereGazed[s])
+            {
+                // Gaze started
+                sphereGazed[s] = true;
+                gazeStartTimes[s] = Time.time;
+
+                HideInstructions();
+                s.GetComponent<Renderer>().material.color = Color.red;
+            }
+            else if (!gazing && sphereGazed[s])
+            {
+                // Gaze ended
+                sphereGazed[s] = false;
+                float endTime = Time.time;
+                float startTime = gazeStartTimes.ContainsKey(s) ? gazeStartTimes[s] : endTime;
+                float duration = endTime - startTime;
+
+                LogEvent("GazeExit", s, startTime, endTime, duration);
+                StartCoroutine(ResetSphere(s));
+            }
+        }
+    }
+
+
+    void OnSphereEnter(GameObject s)
+    {
+        HideInstructions();
+        s.GetComponent<Renderer>().material.color = Color.red;
+        s.transform.position +=
+            (GetCenter() - s.transform.position).normalized * moveDistance;
+        LogEvent("GazeEnter", s);
+    }
+
+    IEnumerator ResetSphere(GameObject s)
+    {
+        yield return new WaitForSeconds(gazeDelay);
+        if (!IsGazing(s))
+            s.GetComponent<Renderer>().material.color = Color.black;
+    }
+
+    /* ──────────────────────── HEAD (cylinder+planes) ───────────────── */
+    void UpdateHeadTracking()
+    {
+        if (!cylFollowing && targetIdx < planes.Length && IsGazing(cylinder))
+            BeginFollow();
+
+    }
+
+    void BeginFollow()
+    {
+        headPickStartTime = Time.time;
+
+        HideInstructions();
+
+        // you’re now “holding” it, so make it BLUE
+        cylinder.GetComponent<Renderer>().material.color = Color.blue;
+
+        // store offset for follow
+        offsetPos = cam.transform.InverseTransformPoint(cylinder.transform.position);
+        offsetRot = Quaternion.Inverse(cam.transform.rotation) * cylinder.transform.rotation;
+
+        cylFollowing = true;
+
+        // ✅ log HeadPick as instantaneous but at correct startTime
+        LogEvent("HeadPick", cylinder, headPickStartTime, headPickStartTime, 0f);
+
+        StartCoroutine(BurstLog("HeadBurst", cylinder));
+    }
+
+
+    void PlaceOnPlane()
+    {
+        cylFollowing = false;
+
+        var plane = planes[targetIdx];
+        float endTime = Time.time;
+        float duration = (headPickStartTime > 0f) ? endTime - headPickStartTime : 0f;
+        LogEvent("HeadPlace", plane, headPickStartTime, endTime, duration);
+
+        StartCoroutine(BurstLog("HeadBurst", cylinder));
+
+        // plane stays RED
+        plane.GetComponent<Renderer>().material.color = Color.red;
+        // cylinder goes back to GREY so your next gaze will turn it BLUE
+        cylinder.GetComponent<Renderer>().material.color = Color.gray;
+
+        // re-prompt user
+        capsuleText.text = "Look at the cylinder to pick it up";
+        instructionShown = true;
+
+        // advance and highlight next plane
+        targetIdx++;
+        if (targetIdx < planes.Length)
+            planes[targetIdx].GetComponent<Renderer>().material.color = Color.green;
+    }
+
+    IEnumerator BurstLog(string evt, GameObject obj)
+    {
+        float burstStartTime = Time.time;
+        float totalTime = 0f;
+        float sampleTime = 0f;
+        float highFreq = 1f / burstHz;       // High-frequency phase
+        float lowFreq = 1f / (burstHz / 2f); // Low-frequency phase
+        float switchTime = burstSpan * 0.3f; // First 30% = high rate
+
+        while (totalTime < burstSpan)
+        {
+            Vector3 headNow = cam.transform.position;
+            float headSpeed = (headNow - lastHead).magnitude / Time.deltaTime;
+
+            if (headSpeed > 0.02f)
+            {
+                float sampleStart = Time.time;
+                LogEvent(evt, obj, burstStartTime, sampleStart, sampleStart - burstStartTime);
+            }
+
+            float wait = totalTime < switchTime ? highFreq : lowFreq;
+            yield return new WaitForSeconds(wait);
+
+            sampleTime += wait;
+            totalTime += wait;
+        }
+    }
+
+
+
+
+    /* ───────────────────────── HAND (gesture) ──────────────────────── */
+    public void OnHandGestureInteraction(GameObject obj)
+    {
+        if (!isHand) return;
+        HideInstructions();
+        obj.GetComponent<Renderer>().material.color = Color.red;
+        float t = Time.time;
+        LogEvent("HandGesture", obj, t, t, 0f);
+    }
+
+    /* ─────────────────────────── HELPERS ───────────────────────────── */
+    bool IsGazing(GameObject obj)
+    {
+        // Build a mask that includes everything _except_ Ignore Raycast
+        int ignoreLayer = LayerMask.NameToLayer("Ignore Raycast");
+        int mask = ~(1 << ignoreLayer);
+
+        Ray ray = new Ray(cam.transform.position, cam.transform.forward);
+        if (Physics.Raycast(ray, out var hit, 100f, mask))
+            return hit.collider.gameObject == obj;
+        return false;
+    }
+
+
+    Vector3 GetCenter()
+    {
+        if (spheres.Length == 0) return Vector3.zero;
+        var sum = Vector3.zero;
+        foreach (var s in spheres) sum += s.transform.position;
+        return sum / spheres.Length;
+    }
+
+    /* ─────────────────────────── LOG EVENT ─────────────────────────── */
+    void LogEvent(string type, GameObject obj, float startTime, float endTime, float duration)
+    {
+        float now = Time.time;
+        if (firstRel < 0f) firstRel = now;
+        float rel = now - firstRel;
+        float interval = (lastRel > 0f) ? rel - lastRel : 0f;
+        lastRel = rel;
+
+        // user info
+        string userId = UserManager.currentUserID;
+        string userName = UserManager.currentUserName;
+
+        // head pose
+        Vector3 headPos = cam.transform.position;
+        Quaternion headRot = cam.transform.rotation;
+
+        // hand pose – LEFT
+        Vector3 leftHandPos = lastHand;
+        Quaternion leftHandRot = Quaternion.identity;
+        var leftHandDev = InputDevices.GetDeviceAtXRNode(XRNode.LeftHand);
+        if (leftHandDev.TryGetFeatureValue(CommonUsages.devicePosition, out Vector3 lPos))
+            leftHandPos = lPos;
+        if (leftHandDev.TryGetFeatureValue(CommonUsages.deviceRotation, out Quaternion lRot))
+            leftHandRot = lRot;
+
+        // hand pose – RIGHT
+        Vector3 rightHandPos = lastHand;
+        Quaternion rightHandRot = Quaternion.identity;
+        var rightHandDev = InputDevices.GetDeviceAtXRNode(XRNode.RightHand);
+        if (rightHandDev.TryGetFeatureValue(CommonUsages.devicePosition, out Vector3 rPos))
+            rightHandPos = rPos;
+        if (rightHandDev.TryGetFeatureValue(CommonUsages.deviceRotation, out Quaternion rRot))
+            rightHandRot = rRot;
+
+        // gaze & metrics
+        Vector3 gazeDir = cam.transform.forward;
+        float distance = Vector3.Distance(headPos, obj.transform.position);
+        float headVel = (headPos - lastHead).magnitude / Time.deltaTime;
+        float leftHandVel = (leftHandPos - lastHand).magnitude / Time.deltaTime;
+        float rightHandVel = (rightHandPos - lastHand).magnitude / Time.deltaTime;
+        lastHead = headPos;
+        lastHand = rightHandPos; // update reference based on right hand (arbitrary choice)
+
+        string speedTier = headVel > 1.2f ? "fast"
+                         : headVel > 0.4f ? "medium"
+                         : "slow";
+
+        string line =
+           $"{sessionId},{userId},{userName},{stepIdx},{type},{obj.name},"
+         + $"{rel:F6},{startTime - firstRel:F6},{endTime - firstRel:F6},{duration:F6},{interval:F6},"
+         + $"{obj.transform.position.x:F6},{obj.transform.position.y:F6},{obj.transform.position.z:F6},"
+         + $"{headPos.x:F6},{headPos.y:F6},{headPos.z:F6},"
+         + $"{headRot.x:F6},{headRot.y:F6},{headRot.z:F6},{headRot.w:F6},"
+         + $"{leftHandPos.x:F6},{leftHandPos.y:F6},{leftHandPos.z:F6},"
+         + $"{leftHandRot.x:F6},{leftHandRot.y:F6},{leftHandRot.z:F6},{leftHandRot.w:F6},"
+         + $"{rightHandPos.x:F6},{rightHandPos.y:F6},{rightHandPos.z:F6},"
+         + $"{rightHandRot.x:F6},{rightHandRot.y:F6},{rightHandRot.z:F6},{rightHandRot.w:F6},"
+         + $"{gazeDir.x:F6},{gazeDir.y:F6},{gazeDir.z:F6},"
+         + $"{distance:F6},{headVel:F6},{leftHandVel:F6},{rightHandVel:F6},{speedTier}\n";
+
+        File.AppendAllText(csvPath, line);
+        ++stepIdx;
+    }
+
+    void LogEvent(string type, GameObject obj)
+    {
+        float now = Time.time;
+        LogEvent(type, obj, now, now, 0f);
+    }
+
+}
